@@ -19,7 +19,7 @@ COPY packages/ ./packages/
 
 # Install all dependencies (including devDependencies for build)
 # This creates proper workspace symlinks
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --ignore-scripts
 
 # Build all packages sequentially to ensure proper dependency resolution
 # Use tsc --build --force to ensure clean builds (no stale incremental data)
@@ -42,7 +42,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/ ./packages/
 
 # Install only production dependencies
-RUN pnpm install --frozen-lockfile --prod
+RUN pnpm install --frozen-lockfile --prod --ignore-scripts
 
 # Force rebuild better-sqlite3 with node-gyp
 RUN cd /app/node_modules/.pnpm/better-sqlite3@11.10.0/node_modules/better-sqlite3 && \
