@@ -165,8 +165,43 @@ export class AAScraper {
       }
     }
 
-    const res = crawlerResult as SearchResponse | null;
-    // Check if direct crawl returned results; if empty/blocked, try FlareSolverr fallback
+    let res = crawlerResult as SearchResponse | null;
+
+    // If primary URL returned 0 results/blocked, try active mirror annas-archive.is
+    if ((!res || res.results.length === 0) && !url.includes('annas-archive.is')) {
+      const fallbackUrl = url.replace(/https:\/\/[^/]+/, 'https://annas-archive.is');
+      logger.info(`[${crawlId}] Primary domain returned 0 results. Trying active mirror ${fallbackUrl}...`);
+      try {
+        const fallbackCrawler = new CheerioCrawler({
+          maxRequestRetries: 2,
+          requestHandlerTimeoutSecs: 20,
+          maxConcurrency: 1,
+          useSessionPool: false,
+          preNavigationHooks: [
+            async ({ request }) => {
+              request.headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              };
+            },
+          ],
+          requestHandler: async ({ $ }) => {
+            const books = AAScraper.parseBooks($);
+            const pagination = AAScraper.parsePagination($);
+            if (books.length > 0) {
+              crawlerResult = { results: books, pagination };
+            }
+          },
+        });
+        await fallbackCrawler.run([`${fallbackUrl}${fallbackUrl.includes('?') ? '&' : '?'}_crawl=${Date.now()}`]);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        logger.warn(`[${crawlId}] Fallback mirror fetch failed: ${msg}`);
+      }
+      res = crawlerResult as SearchResponse | null;
+    }
+
+    // Check if direct crawl / mirror returned results; if empty/blocked, try FlareSolverr fallback
     if (!res || res.results.length === 0) {
       const flareResult = await this.fetchViaFlareSolverr(url, crawlId);
       if (flareResult && flareResult.results.length > 0) {
@@ -383,6 +418,7 @@ export class AAScraper {
   }
 
   private buildSearchUrl(query: SearchQuery): string {
+    const baseUrl = (process.env.AA_BASE_URL || BASE_URL || 'https://annas-archive.is').replace(/\/+$/, '');
     const params = new URLSearchParams();
 
     params.append('q', query.q);
@@ -417,7 +453,7 @@ export class AAScraper {
       query.lang.forEach(l => params.append('lang', l));
     }
 
-    return `${BASE_URL}/search?${params.toString()}`;
+    return `${baseUrl}/search?${params.toString()}`;
   }
 }
 
