@@ -30,9 +30,57 @@ function transformImageUrlToProxy(originalUrl: string | undefined): string | und
 export class AAScraper {
   private lastResult: SearchResponse | null = null;
 
+  private async fetchViaFlareSolverr(url: string, crawlId: string): Promise<SearchResponse | null> {
+    const flaresolverrUrl = process.env.FLARESOLVERR_URL;
+    if (!flaresolverrUrl) {
+      logger.debug(`[${crawlId}] FLARESOLVERR_URL not configured, skipping FlareSolverr fallback`);
+      return null;
+    }
+
+    const endpoint = `${flaresolverrUrl.replace(/\/$/, '')}/v1`;
+    logger.info(`[${crawlId}] Direct request returned no results/blocked. Trying FlareSolverr at ${endpoint}...`);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cmd: 'request.get',
+          url,
+          maxTimeout: 60000,
+        }),
+      });
+
+      if (!response.ok) {
+        logger.warn(`[${crawlId}] FlareSolverr HTTP ${response.status}`);
+        return null;
+      }
+
+      const json = (await response.json()) as { status?: string; solution?: { response?: string }; message?: string };
+      if (json.status === 'ok' && json.solution && json.solution.response) {
+        const cheerio = await import('cheerio');
+        const $ = cheerio.load(json.solution.response);
+        const books = AAScraper.parseBooks($ as unknown as CheerioRoot);
+        const pagination = AAScraper.parsePagination($ as unknown as CheerioRoot);
+        logger.info(`[${crawlId}] FlareSolverr returned ${books.length} books`);
+        if (books.length > 0) {
+          return { results: books, pagination };
+        }
+      } else {
+        logger.warn(`[${crawlId}] FlareSolverr returned status: ${json.status || ''} - ${json.message || ''}`);
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.warn(`[${crawlId}] FlareSolverr request failed: ${msg}`);
+    }
+    return null;
+  }
+
   async scrapeUrl(url: string): Promise<SearchResponse> {
     const crawlId = Math.random().toString(36).substring(7);
     logger.info(`[${crawlId}] Crawler starting for: ${url}`);
+
+    let crawlerResult: SearchResponse | null = null;
 
     const crawler = new CheerioCrawler({
       maxRequestRetries: 3,
@@ -68,7 +116,7 @@ export class AAScraper {
         logger.info(`[${crawlId}] Parsed ${books.length} books in ${parseDuration}ms`);
 
         // Store result for retrieval
-        this.lastResult = {
+        crawlerResult = {
           results: books,
           pagination,
         };
@@ -87,15 +135,12 @@ export class AAScraper {
         }
 
         // Don't throw - return empty result instead
-        this.lastResult = {
+        crawlerResult = {
           results: [],
           pagination: { page: 1, per_page: 50, has_next: false, has_previous: false, estimated_total_results: null },
         };
       },
     });
-
-    // Clear previous result
-    this.lastResult = null;
 
     try {
       // Run crawler - add unique ID to bypass Crawlee's deduplication
@@ -118,19 +163,21 @@ export class AAScraper {
       } else {
         logger.warn(`[${crawlId}] Network error (expected): ${errorMessage}`);
       }
+    }
 
-      // Return empty result if crawler completely fails
-      if (!this.lastResult) {
-        logger.warn(`[${crawlId}] No results available, returning empty`);
-        return {
-          results: [],
-          pagination: { page: 1, per_page: 50, has_next: false, has_previous: false, estimated_total_results: null },
-        };
+    const res = crawlerResult as SearchResponse | null;
+    // Check if direct crawl returned results; if empty/blocked, try FlareSolverr fallback
+    if (!res || res.results.length === 0) {
+      const flareResult = await this.fetchViaFlareSolverr(url, crawlId);
+      if (flareResult && flareResult.results.length > 0) {
+        crawlerResult = flareResult;
       }
     }
 
+    this.lastResult = crawlerResult;
+
     // Return result
-    return this.lastResult || {
+    return crawlerResult || {
       results: [],
       pagination: { page: 1, per_page: 50, has_next: false, has_previous: false, estimated_total_results: null },
     };
@@ -139,114 +186,122 @@ export class AAScraper {
   private static parseBooks($: CheerioRoot): Book[] {
     const books: Book[] = [];
 
-    // Find all book result containers - these have the flex pt-3 pb-3 classes
-    const containers = $('div.flex').filter((i, el) => {
-      const className = $(el).attr('class') || '';
-      return className.includes('pt-3') && className.includes('pb-3');
-    }).toArray();
+    // Find containers by finding all book/md5 links
+    const bookLinks = $('a[href*="/books/"], a[href*="/md5/"]').toArray();
+    const seenContainers = new Set();
 
-    for (const containerEl of containers) {
+    for (const linkEl of bookLinks) {
+      const link = $(linkEl);
+      const containerEl = link.closest('div.flex').get(0) || link.parent().get(0);
+      if (!containerEl || seenContainers.has(containerEl)) continue;
+      seenContainers.add(containerEl);
+
       const container = $(containerEl);
 
-      // Find MD5 link within this container
-      const md5Link = container.find('a[href*="/md5/"]').first();
-      const md5Match = md5Link.attr('href')?.match(/\/md5\/([a-f0-9]{32})/);
+      // Extract link href (could be /md5/... or /books/...)
+      const mainLink = container.find('a[href*="/books/"], a[href*="/md5/"]').first();
+      const href = mainLink.attr('href') || '';
 
-      if (!md5Match) continue;
-      const md5 = md5Match[1];
+      // Try extracting 32-char MD5 from href
+      const md5Match = href.match(/\/(?:md5|books)\/([a-f0-9]{32})/i);
+      let md5 = md5Match ? md5Match[1].toLowerCase() : undefined;
 
-      // Find title link (has font-semibold class)
-      const titleLink = container.find('a.font-semibold').first();
-      const title = titleLink.text().trim();
+      // Fallback: check img src for 32-char MD5 hex
+      if (!md5) {
+        const imgSrc = container.find('img').first().attr('src') || '';
+        const imgMatch = imgSrc.match(/\/([a-f0-9]{32})\.(?:webp|jpg|png)/i);
+        if (imgMatch) {
+          md5 = imgMatch[1].toLowerCase();
+        }
+      }
 
-      if (!title || title.length < 3) continue;
+      // Fallback: check any 32-char hex in href or ID
+      if (!md5) {
+        const anyHexMatch = href.match(/([a-f0-9]{32})/i);
+        if (anyHexMatch) {
+          md5 = anyHexMatch[1].toLowerCase();
+        } else {
+          // Use ID from /books/12345678 if no MD5 available
+          const idMatch = href.match(/\/books\/([^/]+)/);
+          if (idMatch) {
+            md5 = idMatch[1];
+          }
+        }
+      }
 
-      // Extract metadata
-      const containerText = container.text();
+      if (!md5) continue;
 
-      // Extract authors (look for first search link with user icon)
+      // Extract title (from h3 a or font-semibold or first book link)
+      const titleEl = container.find('h3 a, a.font-semibold').first();
+      let title = titleEl.text().trim();
+      if (!title) {
+        title = container.find('a[href*="/books/"], a[href*="/md5/"]').last().text().trim();
+      }
+
+      if (!title || title.length < 2) continue;
+
+      // Extract authors
       const authorLink = container.find('a[href*="/search?q="]').first();
-      const authorText = authorLink.text().trim();
-      const authors = authorText ? authorText.split(/[,;&]/).map(a => a.trim()).filter(a => a) : [];
+      let authorText = authorLink.text().trim();
+      if (!authorText) {
+        const subText = container.find('div.text-sm, .text-gray-500').first().text();
+        authorText = subText.split('·')[0].trim();
+      }
+      const authors = authorText && !authorText.toLowerCase().includes('unknown author')
+        ? authorText.split(/[,;&]/).map((a: string) => a.trim()).filter((a: string) => a)
+        : undefined;
 
-      // Extract publisher/edition info (search link with company icon)
+      // Extract publisher/edition info
       const publisherLink = container.find('a[href*="/search?q="] .icon-\\[mdi--company\\]').parent();
       const publisher = publisherLink.text().trim();
 
-      // Extract description (skip the filename div which also has line-clamp)
+      // Extract description
       const descDiv = container.find('div[class*="line-clamp"]').not('.font-mono').first();
       const description = descDiv.text().trim();
 
-      // Extract cover URL and transform it to use our proxy
+      // Extract cover URL and transform it
       const img = container.find('img').first();
       const originalCoverUrl = img.attr('src');
       const coverUrl = transformImageUrlToProxy(originalCoverUrl);
 
-      // Extract filename (just the basename, not full path)
+      // Extract filename
       const filenameDiv = container.find('div[class*="font-mono"]').first();
       const fullPath = filenameDiv.text().trim();
-      // Extract just filename from path (handles both / and \ separators)
-      const filename = fullPath.split(/[/\\]/).pop() || fullPath;
+      const filename = fullPath ? (fullPath.split(/[/\\]/).pop() || fullPath) : undefined;
 
-      // Parse metadata from text
+      // Extract metadata text
+      const containerText = container.text().replace(/\s+/g, ' ').trim();
+
       const languageMatch = containerText.match(/✅\s*([A-Za-z]+)\s*\[([a-z]{2,3})\]/);
       const language = languageMatch ? languageMatch[2] : undefined;
 
-      const formatMatch = containerText.match(/·\s*(PDF|EPUB|MOBI|ZIP|AZW3|FB2|TXT)\s*·/i);
+      const formatMatch = containerText.match(/·\s*(PDF|EPUB|MOBI|DOC|DOCX|ZIP|AZW3|FB2|TXT)\s*·/i);
       const format = formatMatch ? formatMatch[1].toUpperCase() : undefined;
 
-      // Parse size and convert to bytes (integer)
-      const sizeMatch = containerText.match(/·\s*([\d.]+)\s*([KMG]?B)\s*·/);
+      const sizeMatch = containerText.match(/·\s*([\d.]+)\s*([KMG]?B)\s*·/i);
       let size: number | undefined = undefined;
       if (sizeMatch) {
         const value = parseFloat(sizeMatch[1]);
         const unit = sizeMatch[2].toUpperCase();
-
-        // Convert to bytes
-        if (unit === 'GB') {
-          size = Math.round(value * 1024 * 1024 * 1024);
-        } else if (unit === 'MB') {
-          size = Math.round(value * 1024 * 1024);
-        } else if (unit === 'KB') {
-          size = Math.round(value * 1024);
-        } else if (unit === 'B') {
-          size = Math.round(value);
-        }
+        if (unit === 'GB') size = Math.round(value * 1024 * 1024 * 1024);
+        else if (unit === 'MB') size = Math.round(value * 1024 * 1024);
+        else if (unit === 'KB') size = Math.round(value * 1024);
+        else if (unit === 'B') size = Math.round(value);
       }
 
       const yearMatch = containerText.match(/·\s*(19|20)\d{2}\s*·/);
       const year = yearMatch ? parseInt(yearMatch[0].replace(/·/g, '').trim()) : undefined;
 
-      // Match any content type emoji: 📘 (non-fiction), 📕 (fiction), 📗 (unknown), 📰 (magazine), 💬 (comic), 📝 (standards), 🎶 (musical), 🤨 (other)
       const contentTypeMatch = containerText.match(/(📘|📕|📗|📰|💬|📝|🎶|🤨)\s*(Book\s*\([^)]+\)|Magazine|Comic\s*book|Standards\s*document|Musical\s*score|Other)/i);
       const contentType = contentTypeMatch ? contentTypeMatch[2] : undefined;
 
-      // Extract source(s) - can be multiple sources separated by slashes (e.g., "lgli/zlib")
       const sourceMatch = containerText.match(/🚀\/([a-z/]+)/);
       const source = sourceMatch ? sourceMatch[1] : undefined;
-
-      // Extract stats from DOM (downloads, lists, issues)
-      const statsDiv = container.find('span.text-xs.text-gray-500').first();
-
-      // Downloads/Saves
-      const downloadsSpan = statsDiv.find('span[title="Downloads"]');
-      const downloadsText = downloadsSpan.text().trim();
-      const saves = downloadsText ? parseInt(downloadsText.replace(/[,.\s]/g, '')) || undefined : undefined;
-
-      // Lists
-      const listsSpan = statsDiv.find('span[title="Lists"]');
-      const listsText = listsSpan.text().trim();
-      const lists = listsText ? parseInt(listsText) || undefined : undefined;
-
-      // Issues
-      const issuesSpan = statsDiv.find('span[title="File issues"]');
-      const issuesText = issuesSpan.text().trim();
-      const issues = issuesText ? parseInt(issuesText) || undefined : undefined;
 
       books.push({
         md5,
         title,
-        authors: authors.length > 0 ? authors : undefined,
+        authors,
         publisher: publisher || undefined,
         description: description || undefined,
         coverUrl: coverUrl || undefined,
@@ -257,9 +312,6 @@ export class AAScraper {
         year,
         contentType,
         source,
-        saves,
-        lists,
-        issues,
       });
     }
 
