@@ -51,3 +51,12 @@ app-example
 .tanstack
 packages/api/ingest
 .vite
+
+# local database files
+data/
+*.db
+*.db-journal
+*.sqlite
+
+# generated files
+packages/web/src/routeTree.gen.ts
