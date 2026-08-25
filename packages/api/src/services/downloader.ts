@@ -38,13 +38,14 @@ export interface AAResponse {
 
 export class Downloader {
   async getDownloadUrl(md5: string, pathIndex?: number, domainIndex?: number): Promise<AAResponse> {
-    if (!AA_API_KEY) {
+    const apiKey = process.env.AA_API_KEY || AA_API_KEY;
+    if (!apiKey) {
       throw new Error('AA_API_KEY is not set');
     }
 
     const params = new URLSearchParams({
       md5,
-      key: AA_API_KEY,
+      key: apiKey,
     });
 
     if (pathIndex !== undefined) {
@@ -55,28 +56,47 @@ export class Downloader {
       params.append('domain_index', domainIndex.toString());
     }
 
-    const url = `${AA_BASE_URL}/dyn/api/fast_download.json?${params.toString()}`;
+    const configuredBase = (process.env.AA_BASE_URL || AA_BASE_URL || 'https://annas-archive.pk').replace(/\/+$/, '');
+    const apiDomains = Array.from(new Set([configuredBase, 'https://annas-archive.pk', 'https://annas-archive.org']));
 
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    let lastError = 'Failed to get download URL';
 
-      const response = await fetch(url, {
-        signal: controller.signal,
-      });
+    for (const domain of apiDomains) {
+      const url = `${domain}/dyn/api/fast_download.json?${params.toString()}`;
 
-      clearTimeout(timeout);
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-      const data = await response.json();
+        const response = await fetch(url, {
+          signal: controller.signal,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          },
+        });
 
-      return data as AAResponse;
-    } catch (error: unknown) {
-      logger.error(`Failed to get download URL for ${md5}:`, error);
-      return {
-        download_url: null,
-        error: error instanceof Error ? error.message : 'Failed to get download URL',
-      };
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+          lastError = `HTTP ${response.status} from ${domain}`;
+          continue;
+        }
+
+        const data = (await response.json()) as AAResponse;
+        if (data && (data.download_url || data.error)) {
+          return data;
+        }
+      } catch (error: unknown) {
+        lastError = error instanceof Error ? error.message : 'Failed to get download URL';
+        logger.warn(`Fast download URL fetch failed on ${domain}: ${lastError}`);
+      }
     }
+
+    logger.error(`Failed to get download URL for ${md5}: ${lastError}`);
+    return {
+      download_url: null,
+      error: lastError,
+    };
   }
 
   async download(options: DownloadOptions): Promise<DownloadResult> {

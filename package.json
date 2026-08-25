@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "pnpm --filter @ephemera/shared build",
     "dev": "pnpm --parallel -r dev",
     "dev:api": "pnpm --filter @ephemera/api dev",
     "dev:web": "pnpm --filter @ephemera/web dev",
