@@ -4,6 +4,9 @@
 # Stage 1: Dependencies and Build Environment
 FROM node:22-alpine AS build-env
 
+# Prevent Playwright from downloading browsers during pnpm install
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 # Install build dependencies for native modules (better-sqlite3)
 RUN apk add --no-cache python3 make g++ gcc musl-dev
 
@@ -30,6 +33,9 @@ RUN cd packages/shared && npx tsc --build --force && cd ../.. && \
 # Stage 2: Production Dependencies
 FROM node:22-alpine AS prod-deps
 
+# Prevent Playwright from downloading browsers during pnpm install
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 # Install build dependencies for native modules
 RUN apk add --no-cache python3 make g++ gcc musl-dev
 
@@ -51,8 +57,11 @@ RUN cd /app/node_modules/.pnpm/better-sqlite3@11.10.0/node_modules/better-sqlite
 # Stage 3: Production Runtime
 FROM node:22-alpine AS runtime
 
-# Install packages needed for PUID/PGID support
-RUN apk add --no-cache shadow su-exec
+# Install packages needed for PUID/PGID support and Chromium for Playwright
+RUN apk add --no-cache shadow su-exec chromium nss freetype freetype-dev harfbuzz ca-certificates ttf-freefont
+
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs && \

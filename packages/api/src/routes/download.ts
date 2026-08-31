@@ -14,7 +14,7 @@ const downloadRoute = createRoute({
   description: 'Add a book to the download queue by its MD5 hash. The original filename from the server will be used automatically. Request body is optional.',
   request: {
     params: z.object({
-      md5: z.string().regex(/^[a-f0-9]{32}$/).describe('MD5 hash of the book'),
+      md5: z.string().min(1).describe('MD5 hash of the book'),
     }),
   },
   responses: {
@@ -53,6 +53,16 @@ const downloadRoute = createRoute({
 app.openapi(downloadRoute, async (c) => {
   try {
     const { md5 } = c.req.valid('param');
+
+    if (!/^[a-f0-9]{32}$/i.test(md5)) {
+      return c.json(
+        {
+          error: 'Cannot download book',
+          details: 'This item is a metadata catalog record and does not have an available download file on Anna\'s Archive.',
+        },
+        400
+      );
+    }
 
     logger.info(`Download request for: ${md5}`);
 
@@ -112,7 +122,7 @@ const cancelRoute = createRoute({
   description: 'Remove a book from the download queue',
   request: {
     params: z.object({
-      md5: z.string().regex(/^[a-f0-9]{32}$/).describe('MD5 hash of the book'),
+      md5: z.string().min(1).describe('MD5 hash of the book'),
     }),
   },
   responses: {
@@ -174,7 +184,7 @@ const retryRoute = createRoute({
   description: 'Retry a download that failed or was cancelled. Resets retry count and re-adds to queue.',
   request: {
     params: z.object({
-      md5: z.string().regex(/^[a-f0-9]{32}$/).describe('MD5 hash of the book'),
+      md5: z.string().min(1).describe('MD5 hash of the book'),
     }),
   },
   responses: {
