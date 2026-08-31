@@ -254,7 +254,7 @@ const uploadRoute = createRoute({
   description: 'Manually trigger upload of a downloaded file to Booklore',
   request: {
     params: z.object({
-      md5: z.string().regex(/^[a-f0-9]{32}$/).describe('MD5 hash of the book'),
+      md5: z.string().min(1).describe('MD5 hash of the book'),
     }),
   },
   responses: {
@@ -296,6 +296,16 @@ const uploadRoute = createRoute({
 app.openapi(uploadRoute, async (c) => {
   try {
     const { md5 } = c.req.valid('param');
+
+    if (!/^[a-f0-9]{32}$/i.test(md5)) {
+      return c.json(
+        {
+          error: 'Download not found',
+          details: `Invalid MD5 format: ${md5}`,
+        },
+        404
+      );
+    }
 
     // Check if Booklore is enabled
     const isEnabled = await bookloreSettingsService.isEnabled();
@@ -455,7 +465,7 @@ const retryUploadRoute = createRoute({
   description: 'Retry uploading a file that previously failed',
   request: {
     params: z.object({
-      md5: z.string().regex(/^[a-f0-9]{32}$/).describe('MD5 hash of the book'),
+      md5: z.string().min(1).describe('MD5 hash of the book'),
     }),
   },
   responses: {
@@ -497,6 +507,16 @@ const retryUploadRoute = createRoute({
 app.openapi(retryUploadRoute, async (c) => {
   try {
     const { md5 } = c.req.valid('param');
+
+    if (!/^[a-f0-9]{32}$/i.test(md5)) {
+      return c.json(
+        {
+          error: 'Download not found',
+          details: `Invalid MD5 format: ${md5}`,
+        },
+        404
+      );
+    }
 
     // Get download
     const download = await downloadTracker.get(md5);

@@ -164,7 +164,7 @@ const downloadStatusRoute = createRoute({
   description: 'Get detailed status of a specific download',
   request: {
     params: z.object({
-      md5: z.string().regex(/^[a-f0-9]{32}$/).describe('MD5 hash of the book'),
+      md5: z.string().min(1).describe('MD5 hash of the book'),
     }),
   },
   responses: {
@@ -198,6 +198,16 @@ const downloadStatusRoute = createRoute({
 app.openapi(downloadStatusRoute, async (c) => {
   try {
     const { md5 } = c.req.valid('param');
+
+    if (!/^[a-f0-9]{32}$/i.test(md5)) {
+      return c.json(
+        {
+          error: 'Download not found',
+          details: `Invalid MD5 format: ${md5}`,
+        },
+        404
+      );
+    }
 
     const status = await queueManager.getDownloadStatus(md5);
 
