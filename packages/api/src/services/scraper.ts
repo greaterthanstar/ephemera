@@ -1,4 +1,5 @@
 import { CheerioCrawler, type CheerioRoot } from 'crawlee';
+import { PlaywrightCrawler } from '@crawlee/playwright';
 import type { SearchQuery, Book, SearchResponse } from '@ephemera/shared';
 import { getErrorMessage } from '@ephemera/shared';
 import { logger } from '../utils/logger.js';
@@ -30,50 +31,53 @@ function transformImageUrlToProxy(originalUrl: string | undefined): string | und
 export class AAScraper {
   private lastResult: SearchResponse | null = null;
 
-  private async fetchViaFlareSolverr(url: string, crawlId: string): Promise<SearchResponse | null> {
-    const flaresolverrUrl = process.env.FLARESOLVERR_URL;
-    if (!flaresolverrUrl) {
-      logger.debug(`[${crawlId}] FLARESOLVERR_URL not configured, skipping FlareSolverr fallback`);
-      return null;
-    }
-
-    const endpoint = `${flaresolverrUrl.replace(/\/$/, '')}/v1`;
-    logger.info(`[${crawlId}] Direct request returned no results/blocked. Trying FlareSolverr at ${endpoint}...`);
+  private async fetchViaPlaywright(url: string, crawlId: string): Promise<SearchResponse | null> {
+    logger.info(`[${crawlId}] Direct request returned no results/blocked. Trying Playwright...`);
+    let crawlerResult: SearchResponse | null = null;
 
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          cmd: 'request.get',
-          url,
-          maxTimeout: 60000,
-        }),
+      const crawler = new PlaywrightCrawler({
+        maxRequestRetries: 2,
+        requestHandlerTimeoutSecs: 30,
+        maxConcurrency: 1,
+        // Disable throwing Request blocked error on 403 (DDoS-Guard challenge)
+        sessionPoolOptions: { blockedStatusCodes: [] },
+        useSessionPool: false,
+        // Headless is true by default. We configure it via env vars if needed.
+        browserPoolOptions: {
+          useFingerprints: true,
+        },
+        requestHandler: async ({ page }) => {
+          logger.info(`[${crawlId}] Playwright loaded page, waiting for DDOS-Guard challenge to clear...`);
+          // Wait out the DDOS-Guard challenge (usually takes a few seconds)
+          try {
+            await page.waitForSelector('div.flex', { timeout: 15000 });
+          } catch (_e) {
+            logger.warn(`[${crawlId}] Playwright wait timeout: DDOS-Guard might have blocked or slow load.`);
+          }
+          
+          const html = await page.content();
+          const cheerio = await import('cheerio');
+          const $ = cheerio.load(html);
+          const books = AAScraper.parseBooks($ as unknown as CheerioRoot);
+          const pagination = AAScraper.parsePagination($ as unknown as CheerioRoot);
+          
+          logger.info(`[${crawlId}] Playwright returned ${books.length} books`);
+          if (books.length > 0) {
+            crawlerResult = { results: books, pagination };
+          }
+        },
       });
 
-      if (!response.ok) {
-        logger.warn(`[${crawlId}] FlareSolverr HTTP ${response.status}`);
-        return null;
-      }
-
-      const json = (await response.json()) as { status?: string; solution?: { response?: string }; message?: string };
-      if (json.status === 'ok' && json.solution && json.solution.response) {
-        const cheerio = await import('cheerio');
-        const $ = cheerio.load(json.solution.response);
-        const books = AAScraper.parseBooks($ as unknown as CheerioRoot);
-        const pagination = AAScraper.parsePagination($ as unknown as CheerioRoot);
-        logger.info(`[${crawlId}] FlareSolverr returned ${books.length} books`);
-        if (books.length > 0) {
-          return { results: books, pagination };
-        }
-      } else {
-        logger.warn(`[${crawlId}] FlareSolverr returned status: ${json.status || ''} - ${json.message || ''}`);
-      }
+      // Navigate
+      const uniqueUrl = `${url}${url.includes('?') ? '&' : '?'}_crawl=${Date.now()}`;
+      await crawler.run([uniqueUrl]);
+      return crawlerResult;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      logger.warn(`[${crawlId}] FlareSolverr request failed: ${msg}`);
+      logger.warn(`[${crawlId}] Playwright request failed: ${msg}`);
+      return null;
     }
-    return null;
   }
 
   async scrapeUrl(url: string): Promise<SearchResponse> {
@@ -201,11 +205,11 @@ export class AAScraper {
       res = crawlerResult as SearchResponse | null;
     }
 
-    // Check if direct crawl / mirror returned results; if empty/blocked, try FlareSolverr fallback
+    // Check if direct crawl / mirror returned results; if empty/blocked, try Playwright fallback
     if (!res || res.results.length === 0) {
-      const flareResult = await this.fetchViaFlareSolverr(url, crawlId);
-      if (flareResult && flareResult.results.length > 0) {
-        crawlerResult = flareResult;
+      const pwResult = await this.fetchViaPlaywright(url, crawlId);
+      if (pwResult && pwResult.results.length > 0) {
+        crawlerResult = pwResult;
       }
     }
 
@@ -250,21 +254,16 @@ export class AAScraper {
         }
       }
 
-      // Fallback: check any 32-char hex in href or ID
+      // Fallback: check any 32-char hex in container HTML
       if (!md5) {
-        const anyHexMatch = href.match(/([a-f0-9]{32})/i);
+        const anyHexMatch = container.html()?.match(/([a-f0-9]{32})/i);
         if (anyHexMatch) {
           md5 = anyHexMatch[1].toLowerCase();
-        } else {
-          // Use ID from /books/12345678 if no MD5 available
-          const idMatch = href.match(/\/books\/([^/]+)/);
-          if (idMatch) {
-            md5 = idMatch[1];
-          }
         }
       }
 
-      if (!md5) continue;
+      // Must be a valid 32-character hexadecimal MD5 hash for downloading
+      if (!md5 || !/^[a-f0-9]{32}$/i.test(md5)) continue;
 
       // Extract title (from h3 a or font-semibold or first book link)
       const titleEl = container.find('h3 a, a.font-semibold').first();

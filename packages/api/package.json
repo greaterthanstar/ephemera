@@ -28,6 +28,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@crawlee/playwright": "^3.18.1",
     "@ephemera/shared": "workspace:*",
     "@hono/node-server": "^1.19.6",
     "@hono/swagger-ui": "^0.5.2",
@@ -38,6 +39,7 @@
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.36.4",
     "hono": "^4.6.14",
+    "playwright": "^1.62.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {
